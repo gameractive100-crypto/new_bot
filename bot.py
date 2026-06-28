@@ -765,9 +765,9 @@ def health():
 #
 # STEP 3 — Uncomment karo sirf ye route:
 #
-# @app.route("/ping", methods=["GET"])
-# def ping():
-#     return "pong", 200
+@app.route("/ping", methods=["GET"])
+def ping():
+    return "pong", 200
 #
 # Bas itna hi! Baaki sab already configure hai.
 # Jab local run karna ho — comment out rakho, koi farak nahi padta.
