@@ -36,8 +36,8 @@ DATA_PATH = os.getenv("DATA_PATH") or os.path.join(BASEDIR, "data")
 os.makedirs(DATA_PATH, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_PATH, "ghosttalk.db")
 
-API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "8991129605:AAH6_yZiyT4sq_JU57HFIYChSTiddIPvv9Q"
-ADMIN_ID = int(os.getenv("ADMIN_ID", 8361006824))
+API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") 
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 WARNING_LIMIT = 2
 TEMP_BAN_HOURS = 24
