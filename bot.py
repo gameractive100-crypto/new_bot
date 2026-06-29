@@ -29,15 +29,13 @@ from flask import Flask
 # CONFIG
 # ============================================
 
-# python bot.py
-
 BASEDIR = os.getcwd()
 DATA_PATH = os.getenv("DATA_PATH") or os.path.join(BASEDIR, "data")
 os.makedirs(DATA_PATH, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_PATH, "ghosttalk.db")
 
-API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") 
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TOKEN_HERE"
+ADMIN_ID = int(os.getenv("ADMIN_ID", 8361006824))
 
 WARNING_LIMIT = 2
 TEMP_BAN_HOURS = 24
@@ -264,8 +262,11 @@ def db_is_premium(uid):
     if not u or not u["premium_until"]:
         return False
     try:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         pu = datetime.fromisoformat(u["premium_until"])
-        return pu > datetime.now(timezone.utc).replace(tzinfo=None)
+        if pu.tzinfo is not None:
+            pu = pu.replace(tzinfo=None)
+        return pu > now
     except:
         return False
 
@@ -290,7 +291,12 @@ def db_is_banned(uid):
         return True
     if ban_until:
         try:
-            return datetime.fromisoformat(ban_until) > datetime.now(timezone.utc).replace(tzinfo=None)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            bu = datetime.fromisoformat(ban_until)
+            # strip tz if present so comparison is always naive vs naive
+            if bu.tzinfo is not None:
+                bu = bu.replace(tzinfo=None)
+            return bu > now
         except:
             return False
     return False
@@ -352,15 +358,26 @@ def db_add_referral(referrer_id):
         except:
             pass
 
+# cached at startup — avoid calling get_me() on every refer link request
+_bot_username = None
+
+def get_bot_username():
+    global _bot_username
+    if not _bot_username:
+        try:
+            _bot_username = bot.get_me().username
+        except:
+            pass
+    return _bot_username
+
 def db_get_referral_link(uid):
     u = db_get_user(uid)
     if not u:
         return None
-    try:
-        uname = bot.get_me().username
+    uname = get_bot_username()
+    if uname:
         return f"https://t.me/{uname}?start={u['referral_code']}"
-    except:
-        return f"REFCODE:{u['referral_code']}"
+    return f"REFCODE:{u['referral_code']}"
 
 def resolve_user(identifier):
     if not identifier:
@@ -474,17 +491,35 @@ def _connect(u1, u2):
         pass
     logger.info(f"Matched: {u1} <-> {u2}")
 
-def disconnect_user(uid, notify_partner=True):
+def disconnect_user(uid, notify_partner=True, reason="left"):
     partner = active_pairs.pop(uid, None)
     if partner:
         active_pairs.pop(partner, None)
-        # cleanup games
+        # games + pending media cleanup
         games.pop(uid, None)
         games.pop(partner, None)
+        report_reason_pending.pop(uid, None)
+        report_reason_pending.pop(partner, None)
         if notify_partner:
             try:
+                # "left" = normal disconnect, "banned" = admin kicked
+                if reason == "banned":
+                    msg = "🚫 Partner was removed.\n\nStart fresh?"
+                else:
+                    msg = "👋 Partner left the chat."
+
+                # Inline report button + search again button
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(
+                    types.InlineKeyboardButton(
+                        "🚩 Report this partner",
+                        callback_data=f"exrep:{uid}"   # ex-partner uid
+                    )
+                )
+                bot.send_message(partner, msg, reply_markup=markup)
+                # Send main keyboard separately so they can search again
                 bot.send_message(partner,
-                    "👋 Partner disconnected.\n\nUse 🔀 Search Random to find someone new!",
+                    "Use 🔀 Search Random to find someone new!",
                     reply_markup=main_kb(partner))
             except:
                 pass
@@ -680,7 +715,7 @@ def warn_user(uid, reason):
         except:
             pass
         remove_from_queues(uid)
-        disconnect_user(uid)
+        disconnect_user(uid, notify_partner=True, reason="banned")
     else:
         try:
             bot.send_message(uid,
@@ -763,8 +798,8 @@ def health():
 #   - Interval: 5 minutes
 #   - Yahi ping Render ko alive rakhegi (free tier 15 min sleep hoti hai)
 #
-# STEP 3 — Uncomment karo sirf ye route:
-#
+# STEP 3 — Ye route already uncommented hai, kuch karne ki zaroorat nahi:
+
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
@@ -1043,6 +1078,74 @@ def cb_report(call):
     bot.answer_callback_query(call.id, "Report submitted!", show_alert=False)
     bot.send_message(uid, "✅ Report submitted! Admins reviewing. You can keep chatting.")
 
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("exrep:"))
+def cb_expartner_report(call):
+    """Report after partner left chat"""
+    uid = call.from_user.id
+    try:
+        ex_partner_id = int(call.data.split(":")[1])
+    except:
+        bot.answer_callback_query(call.id, "Invalid.", show_alert=True)
+        return
+
+    # remove the inline button so they can't spam report
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+    # show report reason keyboard
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🔀 Spam", callback_data=f"exreptype:{ex_partner_id}:spam"),
+        types.InlineKeyboardButton("🚫 Unwanted Content", callback_data=f"exreptype:{ex_partner_id}:unwanted"),
+        types.InlineKeyboardButton("😠 Inappropriate Messages", callback_data=f"exreptype:{ex_partner_id}:inappropriate"),
+        types.InlineKeyboardButton("🤔 Suspicious Activity", callback_data=f"exreptype:{ex_partner_id}:suspicious"),
+        types.InlineKeyboardButton("❓ Other", callback_data=f"exreptype:{ex_partner_id}:other"),
+        types.InlineKeyboardButton("❌ Cancel", callback_data="exreptype:cancel"),
+    )
+    bot.answer_callback_query(call.id)
+    bot.send_message(uid, "🚩 Why are you reporting?", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("exreptype:"))
+def cb_expartner_report_type(call):
+    uid = call.from_user.id
+    parts = call.data.split(":")
+
+    if parts[1] == "cancel":
+        bot.answer_callback_query(call.id, "Report cancelled.")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except:
+            pass
+        return
+
+    try:
+        ex_partner_id = int(parts[1])
+        rtype = parts[2]
+    except:
+        bot.answer_callback_query(call.id, "Invalid.", show_alert=True)
+        return
+
+    type_map = {
+        "spam": "Spam", "unwanted": "Unwanted Content",
+        "inappropriate": "Inappropriate Messages",
+        "suspicious": "Suspicious Activity", "other": "Other",
+    }
+    rtype_name = type_map.get(rtype, "Other")
+
+    try:
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    except:
+        pass
+
+    db_add_report(uid, ex_partner_id, rtype_name, "post-chat report")
+    forward_to_admin(uid, ex_partner_id, f"{rtype_name} (after chat ended)")
+    bot.answer_callback_query(call.id, "Report submitted!")
+    bot.send_message(uid, "✅ Report submitted! Thank you for keeping GhostTalk safe. 🧹")
+
 # ============================================
 # GAMES
 # ============================================
@@ -1154,7 +1257,7 @@ def cmd_ban(message):
                 "Thanks for keeping our community clean! 🧹")
         except:
             pass
-    disconnect_user(target, notify_partner=True)
+    disconnect_user(target, notify_partner=True, reason="banned")
     bot.reply_to(message,
         f"✅ {'Permanently' if permanent else f'{hours}h'} banned user {target}.\nReason: {reason}")
 
@@ -1609,6 +1712,127 @@ def setup_commands():
 # MAIN
 # ============================================
 
+# ============================================
+# MEMORY CLEANUP THREAD — har 30 min
+# ============================================
+
+def run_cleanup():
+    """
+    RAM cleanup  (har 30 min):
+      1. chat_history       — sirf live users ki rakho
+      2. report_pending     — stale lock hata do
+      3. pending_country    — set ho gayi ya user nahi
+      4. games              — orphan game hata do
+      5. user_warnings      — banned user ke counts
+
+    DB cleanup  (har 30 min):
+      6. bans               — expired temp bans delete (auto-unban)
+      7. users              — adha profile, 24h se purana → delete
+      8. reports            — sirf last 500 rakho, baki trim
+    """
+    import time
+    INTERVAL = 30 * 60  # 30 minutes
+
+    while True:
+        time.sleep(INTERVAL)
+        try:
+            # ── RAM cleanup ──────────────────────────────────
+            live = (set(active_pairs.keys())
+                    | set(waiting_random)
+                    | {u for u, _ in waiting_opposite})
+
+            # 1. chat_history
+            before_h = len(chat_history)
+            for uid in [k for k in list(chat_history.keys()) if k not in live]:
+                del chat_history[uid]
+            for uid in list(chat_history.keys()):
+                if len(chat_history[uid]) > 50:
+                    chat_history[uid] = chat_history[uid][-50:]
+
+            # 2. stale report locks
+            before_r = len(report_reason_pending)
+            for uid in [k for k in list(report_reason_pending.keys())
+                        if k not in active_pairs]:
+                del report_reason_pending[uid]
+
+            # 3. pending_country
+            before_c = len(pending_country)
+            for uid in [u for u in list(pending_country)
+                        if not db_get_user(u) or (db_get_user(u) or {}).get("country")]:
+                pending_country.discard(uid)
+
+            # 4. orphan games
+            before_g = len(games)
+            for uid in [k for k in list(games.keys()) if k not in active_pairs]:
+                games.pop(uid, None)
+
+            # 5. warnings for banned users
+            before_w = len(user_warnings)
+            for uid in [k for k in list(user_warnings.keys()) if db_is_banned(uid)]:
+                del user_warnings[uid]
+
+            ram_freed = {
+                "history": before_h - len(chat_history),
+                "rep_locks": before_r - len(report_reason_pending),
+                "country_q": before_c - len(pending_country),
+                "games": before_g - len(games),
+                "warnings": before_w - len(user_warnings),
+            }
+
+            # ── DB cleanup ───────────────────────────────────
+            now_iso = datetime.now(timezone.utc).isoformat()
+            # cutoff for incomplete profiles: 24 hours ago
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+            db_stats = {}
+            with get_conn() as c:
+                # 6. expired temp bans — delete so db_is_banned() returns False cleanly
+                r = c.execute(
+                    "DELETE FROM bans WHERE permanent=0 AND ban_until IS NOT NULL AND ban_until <= ?",
+                    (now_iso,)
+                )
+                db_stats["expired_bans"] = r.rowcount
+
+                # 7. incomplete profiles older than 24h
+                # incomplete = gender OR age OR country is NULL
+                r = c.execute(
+                    """DELETE FROM users
+                       WHERE joined_at <= ?
+                         AND (gender IS NULL OR age IS NULL OR country IS NULL)""",
+                    (cutoff_iso,)
+                )
+                db_stats["incomplete_profiles"] = r.rowcount
+
+                # 8. trim reports — keep only latest 500 per reported_id
+                # first delete old ones beyond 500
+                r = c.execute(
+                    """DELETE FROM reports WHERE id NOT IN (
+                           SELECT id FROM reports
+                           ORDER BY id DESC LIMIT 500
+                       )"""
+                )
+                db_stats["old_reports"] = r.rowcount
+
+                c.commit()
+
+            # log only what changed
+            all_freed = {k: v for k, v in {**ram_freed, **db_stats}.items() if v > 0}
+            if all_freed:
+                logger.info(
+                    f"[CLEANUP] Freed: {all_freed} | "
+                    f"Active: {len(active_pairs)} pairs | "
+                    f"Queue: {len(waiting_random)+len(waiting_opposite)}"
+                )
+            else:
+                logger.info(
+                    f"[CLEANUP] Nothing to clean | "
+                    f"Active: {len(active_pairs)} pairs"
+                )
+
+        except Exception as e:
+            logger.error(f"[CLEANUP] Error: {e}")
+
+
 if __name__ == "__main__":
     logger.info("Initializing DB...")
     init_db()
@@ -1623,11 +1847,17 @@ if __name__ == "__main__":
     logger.info("✅ Referral atomic read fixed")
     logger.info("✅ /word command added")
     logger.info("✅ /msg admin broadcast (memory-safe)")
-    logger.info("✅ Render + UptimeRobot setup (see FLASK section)")
+    logger.info("✅ Render + UptimeRobot setup")
+    logger.info("✅ Memory cleanup thread (30 min)")
     logger.info("=" * 50)
 
-    # Flask server — needed for Render deployment (keeps dyno alive)
-    # PORT env var auto-set by Render; locally defaults to 5000
+    # cache bot username once at startup
+    get_bot_username()
+
+    # Memory cleanup background thread
+    threading.Thread(target=run_cleanup, daemon=True).start()
+
+    # Flask — Render ke liye
     port = int(os.getenv("PORT", 5000))
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=port, debug=False),
@@ -1635,5 +1865,5 @@ if __name__ == "__main__":
     ).start()
     logger.info(f"Flask running on port {port}")
 
-    # Start Telegram polling
+    # Telegram polling
     bot.infinity_polling(timeout=30, long_polling_timeout=30)
