@@ -16,7 +16,6 @@ Fixes applied:
 
 import os
 import re
-import sqlite3
 import random
 import threading
 import logging
@@ -25,22 +24,36 @@ import telebot
 from telebot import types
 from flask import Flask
 
+# ── Distributed system: Render temp queue/cache + Laptop master DB ──
+from queue_db import (
+    get_cached_user, cache_user, upsert_user_cache_field,
+    is_banned_cached, cache_ban, remove_ban_cache, purge_expired_bans,
+    increment_messages, increment_media, increment_referral,
+    get_user_by_refcode, get_user_by_username, iter_user_ids, local_counts,
+    get_queue_stats,
+)
+from sync_engine import (
+    push_event, init_distributed_system, set_notify_callback,
+    get_laptop_stats, laptop_online,
+)
+
 # ============================================
 # CONFIG
 # ============================================
 
 BASEDIR = os.getcwd()
-DATA_PATH = os.getenv("DATA_PATH") or os.path.join(BASEDIR, "data")
-os.makedirs(DATA_PATH, exist_ok=True)
-DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_PATH, "ghosttalk.db")
 
 API_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "YOUR_TOKEN_HERE"
 ADMIN_ID = int(os.getenv("ADMIN_ID", 8361006824))
 
-WARNING_LIMIT = 2
-TEMP_BAN_HOURS = 24
-PREMIUM_REFERRALS_NEEDED = 3
-PREMIUM_DURATION_HOURS = 1
+# Content-warning ban: decided INSTANTLY on Render so it works even if laptop is offline.
+WARNING_LIMIT = int(os.getenv("WARNING_LIMIT", "2"))
+TEMP_BAN_HOURS = int(os.getenv("TEMP_BAN_HOURS", "24"))
+
+# DISPLAY ONLY. The LAPTOP actually decides when premium is granted.
+# Keep these EQUAL to REFERRAL_THRESHOLD / PREMIUM_HOURS in laptop_server.py.
+PREMIUM_REFERRALS_NEEDED = int(os.getenv("REFERRAL_THRESHOLD", "5"))
+PREMIUM_DURATION_HOURS = int(os.getenv("PREMIUM_HOURS", "1"))
 
 # ============================================
 # LOGGING
@@ -176,90 +189,68 @@ def get_country_info(user_input):
 # DATABASE
 # ============================================
 
-def get_conn():
-    parent = os.path.dirname(DB_PATH) or BASEDIR
-    os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+def _gen_ref_code(uid):
+    return f"REF{uid}{random.randint(1000, 99999)}"
 
-def init_db():
-    with get_conn() as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                gender TEXT,
-                age INTEGER,
-                country TEXT,
-                country_flag TEXT,
-                messages_sent INTEGER DEFAULT 0,
-                media_approved INTEGER DEFAULT 0,
-                media_rejected INTEGER DEFAULT 0,
-                referral_code TEXT UNIQUE,
-                referral_count INTEGER DEFAULT 0,
-                premium_until TEXT,
-                joined_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS bans (
-                user_id INTEGER PRIMARY KEY,
-                ban_until TEXT,
-                permanent INTEGER DEFAULT 0,
-                reason TEXT
-            );
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reporter_id INTEGER,
-                reported_id INTEGER,
-                report_type TEXT,
-                reason TEXT,
-                timestamp TEXT
-            );
-        """)
-        c.commit()
 
 def db_get_user(uid):
-    with get_conn() as c:
-        row = c.execute(
-            "SELECT user_id,username,first_name,gender,age,country,country_flag,"
-            "messages_sent,media_approved,media_rejected,referral_code,referral_count,premium_until "
-            "FROM users WHERE user_id=?", (uid,)
-        ).fetchone()
-    if not row:
-        return None
-    keys = ["user_id","username","first_name","gender","age","country","country_flag",
-            "messages_sent","media_approved","media_rejected","referral_code","referral_count","premium_until"]
-    return dict(zip(keys, row))
+    """Read from local cache (warmed from laptop on startup / via side-effects)."""
+    return get_cached_user(uid)
+
 
 def db_create_user(tg_user):
-    if db_get_user(tg_user.id):
+    existing = get_cached_user(tg_user.id)
+    if existing:
+        # keep username / first_name fresh
+        if (existing.get("username") or "") != (tg_user.username or "") or \
+           (existing.get("first_name") or "") != (tg_user.first_name or ""):
+            upsert_user_cache_field(
+                tg_user.id,
+                username=tg_user.username or "",
+                first_name=tg_user.first_name or "",
+            )
+            push_event(tg_user.id, "PROFILE_UPDATE", {
+                "username": tg_user.username or "",
+                "first_name": tg_user.first_name or "",
+            })
         return
-    code = f"REF{tg_user.id}{random.randint(1000,99999)}"
-    with get_conn() as c:
-        c.execute(
-            "INSERT OR IGNORE INTO users "
-            "(user_id,username,first_name,gender,age,country,country_flag,joined_at,referral_code) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (tg_user.id, tg_user.username or "", tg_user.first_name or "",
-             None, None, None, None, datetime.now(timezone.utc).isoformat(), code)
-        )
-        c.commit()
+    code = _gen_ref_code(tg_user.id)
+    cache_user(tg_user.id, {
+        "username": tg_user.username or "",
+        "first_name": tg_user.first_name or "",
+        "gender": None, "age": None, "country": None, "country_flag": None,
+        "is_premium": 0, "premium_until": None,
+        "referral_code": code, "referral_count": 0,
+        "messages_sent": 0, "media_approved": 0,
+    })
+    push_event(tg_user.id, "REGISTER", {
+        "username": tg_user.username or "",
+        "first_name": tg_user.first_name or "",
+        "referral_code": code,
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+    })
+
 
 def db_update(uid, **fields):
+    """Profile updates: cache instantly + push PROFILE_UPDATE.
+    Premium changes must go through db_set_premium/db_remove_premium."""
     if not fields:
         return
-    # handle None values
-    cols = ", ".join(f"{k}=?" for k in fields)
-    with get_conn() as c:
-        c.execute(f"UPDATE users SET {cols} WHERE user_id=?", (*fields.values(), uid))
-        c.commit()
+    if "premium_until" in fields and fields["premium_until"] is None and len(fields) == 1:
+        db_remove_premium(uid)
+        return
+    upsert_user_cache_field(uid, **fields)
+    profile = {k: v for k, v in fields.items()
+               if k in ("gender", "age", "country", "country_flag", "username", "first_name")}
+    if profile:
+        push_event(uid, "PROFILE_UPDATE", profile)
+
 
 def db_is_premium(uid):
     if uid == ADMIN_ID:
         return True
-    u = db_get_user(uid)
-    if not u or not u["premium_until"]:
+    u = get_cached_user(uid)
+    if not u or not u.get("premium_until"):
         return False
     try:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -267,108 +258,93 @@ def db_is_premium(uid):
         if pu.tzinfo is not None:
             pu = pu.replace(tzinfo=None)
         return pu > now
-    except:
+    except Exception:
         return False
 
+
 def db_set_premium(uid, until_str):
+    """Admin: add premium until a date/datetime. Symmetric with db_remove_premium."""
     try:
         s = f"{until_str}T23:59:59" if len(until_str) == 10 else until_str
         dt = datetime.fromisoformat(s)
-        db_update(uid, premium_until=dt.isoformat())
+        iso = dt.isoformat()
+        upsert_user_cache_field(uid, is_premium=1, premium_until=iso)
+        push_event(uid, "PREMIUM_SET", {"premium_until": iso})
         return True
-    except:
+    except Exception:
         return False
+
+
+def db_remove_premium(uid):
+    """Admin: remove premium. Mirror of db_set_premium."""
+    upsert_user_cache_field(uid, is_premium=0, premium_until=None)
+    push_event(uid, "PREMIUM_SET", {"premium_until": None})
+
 
 def db_is_banned(uid):
     if uid == ADMIN_ID:
         return False
-    with get_conn() as c:
-        row = c.execute("SELECT ban_until,permanent FROM bans WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        return False
-    ban_until, permanent = row
-    if permanent:
-        return True
-    if ban_until:
-        try:
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            bu = datetime.fromisoformat(ban_until)
-            # strip tz if present so comparison is always naive vs naive
-            if bu.tzinfo is not None:
-                bu = bu.replace(tzinfo=None)
-            return bu > now
-        except:
-            return False
-    return False
+    return is_banned_cached(uid)
+
 
 def db_ban(uid, hours=None, permanent=False, reason=""):
-    with get_conn() as c:
-        if permanent:
-            c.execute("INSERT OR REPLACE INTO bans VALUES (?,?,?,?)", (uid, None, 1, reason))
-        else:
-            until = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat() if hours else None
-            c.execute("INSERT OR REPLACE INTO bans VALUES (?,?,?,?)", (uid, until, 0, reason))
-        c.commit()
+    """Admin / content ban: decided here, cached instantly, pushed to master.
+    Symmetric with db_unban."""
+    ban_until = None if permanent else (
+        datetime.now(timezone.utc) + timedelta(hours=hours or TEMP_BAN_HOURS)
+    ).isoformat()
+    cache_ban(uid, ban_until, permanent, reason)
+    push_event(uid, "BAN_USER", {
+        "hours": hours or TEMP_BAN_HOURS,
+        "permanent": bool(permanent),
+        "reason": reason,
+    })
+
 
 def db_unban(uid):
-    with get_conn() as c:
-        c.execute("DELETE FROM bans WHERE user_id=?", (uid,))
-        c.commit()
+    """Mirror of db_ban. Also clears the user's report counter on the master."""
+    remove_ban_cache(uid)
+    push_event(uid, "UNBAN_USER", {})
+
 
 def db_add_report(reporter_id, reported_id, report_type, reason):
-    ts = datetime.now(timezone.utc).isoformat()
-    with get_conn() as c:
-        c.execute(
-            "INSERT INTO reports (reporter_id,reported_id,report_type,reason,timestamp) VALUES (?,?,?,?,?)",
-            (reporter_id, reported_id, report_type, reason, ts)
-        )
-        count = c.execute("SELECT COUNT(*) FROM reports WHERE reported_id=?", (reported_id,)).fetchone()[0]
-        c.commit()
+    """Laptop counts reports and decides the auto-ban (returns a BAN_USER side-effect)."""
+    push_event(reporter_id, "REPORT_USER", {
+        "reported_id": reported_id,
+        "report_type": report_type,
+        "reason": reason,
+    })
 
-    # auto-ban at 10 reports
-    if count >= 10 and not db_is_banned(reported_id):
-        db_ban(reported_id, hours=168, reason="Auto-banned: 10+ reports")
-        dt_str = datetime.fromisoformat(ts).strftime("%Y-%m-%d at %H:%M")
-        with get_conn() as c:
-            reporters = c.execute(
-                "SELECT DISTINCT reporter_id FROM reports WHERE reported_id=?", (reported_id,)
-            ).fetchall()
-        for (rid,) in reporters:
-            try:
-                bot.send_message(rid,
-                    f"✅ Action Taken!\nReport reviewed & action taken on {dt_str}\n"
-                    "Thanks for keeping our community clean! 🧹")
-            except:
-                pass
 
 def db_add_referral(referrer_id):
-    # atomic: increment then read in same connection
-    with get_conn() as c:
-        c.execute("UPDATE users SET referral_count=referral_count+1 WHERE user_id=?", (referrer_id,))
-        c.commit()
-        count = c.execute("SELECT referral_count FROM users WHERE user_id=?", (referrer_id,)).fetchone()[0]
+    """Laptop counts referrals and grants premium. Local bump = instant UI only."""
+    increment_referral(referrer_id)
+    push_event(referrer_id, "REFERRAL_INCREMENT", {"referrer_id": referrer_id})
 
-    if count >= PREMIUM_REFERRALS_NEEDED:
-        until = (datetime.now(timezone.utc) + timedelta(hours=PREMIUM_DURATION_HOURS)).isoformat()
-        db_update(referrer_id, premium_until=until, referral_count=0)
-        try:
-            bot.send_message(referrer_id,
-                f"🎉 PREMIUM UNLOCKED!\n{PREMIUM_DURATION_HOURS}h premium earned!\n"
-                "♀️ Opposite gender search unlocked!")
-        except:
-            pass
+
+def db_count_message(uid):
+    increment_messages(uid)
+    push_event(uid, "MESSAGE", {})
+
+
+def db_count_media(uid):
+    increment_media(uid)
+    push_event(uid, "MEDIA", {})
+
 
 # cached at startup — avoid calling get_me() on every refer link request
 _bot_username = None
+
 
 def get_bot_username():
     global _bot_username
     if not _bot_username:
         try:
             _bot_username = bot.get_me().username
-        except:
+        except Exception:
             pass
     return _bot_username
+
 
 def db_get_referral_link(uid):
     u = db_get_user(uid)
@@ -379,21 +355,22 @@ def db_get_referral_link(uid):
         return f"https://t.me/{uname}?start={u['referral_code']}"
     return f"REFCODE:{u['referral_code']}"
 
+
 def resolve_user(identifier):
     if not identifier:
         return None
     try:
         return int(identifier.strip())
-    except:
+    except Exception:
         pass
-    uname = identifier.strip().lstrip("@")
-    with get_conn() as c:
-        row = c.execute("SELECT user_id FROM users WHERE LOWER(username)=LOWER(?)", (uname,)).fetchone()
-    return row[0] if row else None
+    u = get_user_by_username(identifier)
+    return u["user_id"] if u else None
+
 
 def user_label(uid):
     u = db_get_user(uid)
     return f"@{u['username']}" if (u and u.get("username")) else str(uid)
+
 
 # ============================================
 # KEYBOARDS
@@ -729,6 +706,65 @@ def profile_complete(uid):
     return bool(u and u["gender"] and u["age"] and u["country"])
 
 # ============================================
+# LAPTOP SIDE-EFFECTS  (master DB -> user notifications)
+# ============================================
+#
+# sync_engine calls this for every side-effect the laptop returns.
+# The cache is ALREADY updated by sync_engine; here we just message the user
+# and react (e.g. disconnect a freshly-banned user). Wrapped in try/except
+# because it runs inside the background sync thread.
+
+def on_side_effect(effect: dict):
+    etype = effect.get("type")
+    uid = effect.get("user_id")
+
+    if etype == "BAN_USER":
+        # auto-ban from reports (laptop decided). Kick + notify.
+        try:
+            remove_from_queues(uid)
+            disconnect_user(uid, notify_partner=True, reason="banned")
+        except Exception:
+            pass
+        reason = effect.get("reason", "Multiple reports")
+        try:
+            bot.send_message(uid, f"🚫 You have been banned.\nReason: {reason}")
+        except Exception:
+            pass
+        # thank the reporters (auto-ban only)
+        for rid in effect.get("reporters", []) or []:
+            try:
+                bot.send_message(rid,
+                    "✅ Action Taken!\nA user you reported has been banned.\n"
+                    "Thanks for keeping our community clean! 🧹")
+            except Exception:
+                pass
+
+    elif etype == "UNBAN_USER":
+        try:
+            bot.send_message(uid, "✅ Your ban has been lifted! Welcome back.",
+                             reply_markup=main_kb(uid))
+        except Exception:
+            pass
+
+    elif etype == "PREMIUM_ACTIVATED":
+        via = effect.get("via")
+        if via == "referral":
+            txt = (f"🎉 PREMIUM UNLOCKED!\n{PREMIUM_DURATION_HOURS}h premium earned via referrals!\n"
+                   "♀️ Opposite gender search unlocked!")
+        else:
+            txt = "🎉 PREMIUM ACTIVATED!\n♀️ Opposite gender search unlocked!"
+        try:
+            bot.send_message(uid, txt, reply_markup=main_kb(uid))
+        except Exception:
+            pass
+
+    elif etype == "PREMIUM_EXPIRED":
+        try:
+            bot.send_message(uid, "⚠️ Your premium has ended.", reply_markup=main_kb(uid))
+        except Exception:
+            pass
+
+# ============================================
 # PROFILE SETUP STEPS
 # ============================================
 
@@ -824,10 +860,9 @@ def cmd_start(message):
     parts = message.text.split()
     if len(parts) > 1:
         ref_code = parts[1]
-        with get_conn() as c:
-            row = c.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,)).fetchone()
-        if row and row[0] != uid:
-            db_add_referral(row[0])
+        referrer = get_user_by_refcode(ref_code)
+        if referrer and referrer["user_id"] != uid:
+            db_add_referral(referrer["user_id"])
             bot.send_message(uid, "✅ You joined via a referral link!")
 
     u = db_get_user(uid)
@@ -1247,17 +1282,12 @@ def cmd_ban(message):
             pass
     reason = " ".join(parts[3:]) if len(parts) >= 4 else "Banned by admin"
     db_ban(target, hours=None if permanent else hours, permanent=permanent, reason=reason)
-    dt_str = datetime.now(timezone.utc).strftime("%Y-%m-%d at %H:%M")
-    with get_conn() as c:
-        reporters = c.execute("SELECT DISTINCT reporter_id FROM reports WHERE reported_id=?", (target,)).fetchall()
-    for (rid,) in reporters:
-        try:
-            bot.send_message(rid,
-                f"✅ Action Taken!\nReport reviewed on {dt_str}\n"
-                "Thanks for keeping our community clean! 🧹")
-        except:
-            pass
     disconnect_user(target, notify_partner=True, reason="banned")
+    try:
+        bot.send_message(target,
+            f"🚫 You have been {'permanently ' if permanent else ''}banned.\nReason: {reason}")
+    except:
+        pass
     bot.reply_to(message,
         f"✅ {'Permanently' if permanent else f'{hours}h'} banned user {target}.\nReason: {reason}")
 
@@ -1316,12 +1346,85 @@ def cmd_prrem(message):
     if not target:
         bot.reply_to(message, f"User not found: {parts[1]}")
         return
-    db_update(target, premium_until=None)
+    db_remove_premium(target)
     bot.reply_to(message, f"✅ Premium removed for {target}")
     try:
         bot.send_message(target, "⚠️ Your premium has been removed.", reply_markup=main_kb(target))
     except:
         pass
+
+@bot.message_handler(commands=["stats"])
+def cmd_botstats(message):
+    """Admin only — bot memory + DB snapshot, zero extra RAM"""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    # ── Master DB stats from laptop (authoritative) ──────────────
+    laptop = get_laptop_stats()           # None if laptop offline
+    lc = local_counts()                   # local cache snapshot
+    qstats = get_queue_stats()            # pending sync queue
+
+    # ── Runtime RAM dicts ────────────────────────────────────────
+    active_chats   = len(active_pairs) // 2        # pairs, not individuals
+    queue_random   = len(waiting_random)
+    queue_opp      = len(waiting_opposite)
+    active_games   = len(games) // 2               # same dict stored twice
+    rep_locks      = len(report_reason_pending)
+    hist_users     = len(chat_history)
+    warn_tracked   = len(user_warnings)
+    pending_c      = len(pending_country)
+
+    try:
+        import resource
+        ram_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        ram_str = f"{ram_mb:.1f} MB (peak RSS)"
+    except Exception:
+        ram_str = "N/A (use Render dashboard)"
+
+    if laptop:
+        master = (
+            "💾 MASTER DB (laptop) ✅\n"
+            f"  Total users    : {laptop.get('total_users', 0)}\n"
+            f"  Premium active : {laptop.get('premium_users', 0)}\n"
+            f"  Temp bans      : {laptop.get('temp_bans', 0)}\n"
+            f"  Permanent bans : {laptop.get('permanent_bans', 0)}\n"
+            f"  Total reports  : {laptop.get('total_reports', 0)}\n"
+            f"  Total messages : {laptop.get('total_messages', 0):,}\n"
+        )
+    else:
+        master = "💾 MASTER DB (laptop) ❌ OFFLINE — showing cache only\n"
+
+    msg = (
+        "📊 BOT STATS\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        + master + "\n"
+
+        "🗃 RENDER CACHE\n"
+        f"  Cached users   : {lc['cached_users']}\n"
+        f"  Cached bans    : {lc['cached_bans']}\n"
+        f"  Cached premium : {lc['cached_premium']}\n\n"
+
+        "🔁 SYNC QUEUE\n"
+        f"  Pending events : {qstats['pending']}\n"
+        f"  Syncing events : {qstats['syncing']}\n"
+        f"  Oldest pending : {qstats['oldest_event'] or '-'}\n\n"
+
+        "💬 LIVE ACTIVITY\n"
+        f"  Active chats   : {active_chats} pairs\n"
+        f"  Queue (random) : {queue_random}\n"
+        f"  Queue (opp)    : {queue_opp}\n"
+        f"  Active games   : {active_games}\n\n"
+
+        "🧠 RAM (runtime dicts)\n"
+        f"  chat_history   : {hist_users} users\n"
+        f"  warnings       : {warn_tracked}\n"
+        f"  report locks   : {rep_locks}\n"
+        f"  pending country: {pending_c}\n"
+        f"  Process RAM    : {ram_str}\n"
+    )
+
+    bot.reply_to(message, msg)
+
 
 @bot.message_handler(commands=["rules"])
 def cmd_rules(message):
@@ -1456,9 +1559,7 @@ def handler_text(message):
         append_history(uid, message.chat.id, message.message_id)
         try:
             bot.send_message(partner, text)
-            with get_conn() as c:
-                c.execute("UPDATE users SET messages_sent=messages_sent+1 WHERE user_id=?", (uid,))
-                c.commit()
+            db_count_message(uid)
         except Exception as e:
             logger.error(f"Forward error: {e}")
             bot.send_message(uid, "❌ Could not send message. Partner may have left.")
@@ -1503,8 +1604,7 @@ def handle_media(message):
     if mtype == "sticker":
         try:
             bot.send_sticker(partner, media_id)
-            u = db_get_user(uid)
-            db_update(uid, media_approved=(u["media_approved"] + 1) if u else 1)
+            db_count_media(uid)
         except:
             bot.send_message(uid, "❌ Could not send sticker.")
         return
@@ -1556,9 +1656,7 @@ def cb_media(call):
     if fn:
         try:
             fn(call.from_user.id, media_id)
-            u = db_get_user(sender_id)
-            if u:
-                db_update(sender_id, media_approved=u["media_approved"] + 1)
+            db_count_media(sender_id)
             bot.send_message(sender_id, "✅ Media delivered!")
         except Exception as e:
             logger.error(f"Media deliver error: {e}")
@@ -1610,15 +1708,13 @@ def cmd_broadcast(message):
     # Broadcast text — sirf is scope mein, koi DB mein save nahi
     broadcast_text = parts[1].strip()
 
-    # Kitne users hain — lightweight COUNT query
-    with get_conn() as c:
-        total = c.execute(
-            "SELECT COUNT(*) FROM users WHERE user_id != ?", (ADMIN_ID,)
-        ).fetchone()[0]
+    # Users from the local cache (warmed from laptop on startup)
+    lc = local_counts()
+    total = lc["cached_users"]
 
     bot.reply_to(message,
         f"📢 Broadcast shuru...\n"
-        f"👥 {total} users ko jayega\n\n"
+        f"👥 ~{total} cached users ko jayega\n\n"
         f"Message:\n{broadcast_text}")
 
     # --- BACKGROUND THREAD ---
@@ -1632,18 +1728,13 @@ def cmd_broadcast(message):
         BATCH = 50  # 50 IDs at a time → RAM safe
 
         while True:
-            # Sirf user_id fetch karo, koi extra data nahi
-            with get_conn() as c:
-                rows = c.execute(
-                    "SELECT user_id FROM users WHERE user_id != ?"
-                    " LIMIT ? OFFSET ?",
-                    (ADMIN_ID, BATCH, offset)
-                ).fetchall()
-
+            rows = iter_user_ids(BATCH, offset)
             if not rows:
                 break  # sab ho gaye
 
-            for (to_uid,) in rows:
+            for to_uid in rows:
+                if to_uid == ADMIN_ID:
+                    continue
                 try:
                     bot.send_message(to_uid, text)
                     sent += 1
@@ -1702,7 +1793,8 @@ def setup_commands():
             types.BotCommand("unban", "Unban a user"),
             types.BotCommand("pradd", "Add premium to user"),
             types.BotCommand("prrem", "Remove user premium"),
-            types.BotCommand("msg", "Broadcast message to all users"),
+            types.BotCommand("msg", "Broadcast to all users"),
+            types.BotCommand("stats", "Bot memory + DB stats"),
         ]
         bot.set_my_commands(admin_cmds, scope=types.BotCommandScopeChat(chat_id=ADMIN_ID))
     except:
@@ -1725,10 +1817,11 @@ def run_cleanup():
       4. games              — orphan game hata do
       5. user_warnings      — banned user ke counts
 
-    DB cleanup  (har 30 min):
-      6. bans               — expired temp bans delete (auto-unban)
-      7. users              — adha profile, 24h se purana → delete
-      8. reports            — sirf last 500 rakho, baki trim
+    CACHE cleanup  (har 30 min):
+      6. ban_cache          — expired temp bans hata do (auto-unban)
+
+    NOTE: permanent DB cleanup (incomplete users / old reports) ab LAPTOP
+    karta hai — Render ke paas permanent data hai hi nahi.
     """
     import time
     INTERVAL = 30 * 60  # 30 minutes
@@ -1779,44 +1872,12 @@ def run_cleanup():
                 "warnings": before_w - len(user_warnings),
             }
 
-            # ── DB cleanup ───────────────────────────────────
-            now_iso = datetime.now(timezone.utc).isoformat()
-            # cutoff for incomplete profiles: 24 hours ago
-            cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-
-            db_stats = {}
-            with get_conn() as c:
-                # 6. expired temp bans — delete so db_is_banned() returns False cleanly
-                r = c.execute(
-                    "DELETE FROM bans WHERE permanent=0 AND ban_until IS NOT NULL AND ban_until <= ?",
-                    (now_iso,)
-                )
-                db_stats["expired_bans"] = r.rowcount
-
-                # 7. incomplete profiles older than 24h
-                # incomplete = gender OR age OR country is NULL
-                r = c.execute(
-                    """DELETE FROM users
-                       WHERE joined_at <= ?
-                         AND (gender IS NULL OR age IS NULL OR country IS NULL)""",
-                    (cutoff_iso,)
-                )
-                db_stats["incomplete_profiles"] = r.rowcount
-
-                # 8. trim reports — keep only latest 500 per reported_id
-                # first delete old ones beyond 500
-                r = c.execute(
-                    """DELETE FROM reports WHERE id NOT IN (
-                           SELECT id FROM reports
-                           ORDER BY id DESC LIMIT 500
-                       )"""
-                )
-                db_stats["old_reports"] = r.rowcount
-
-                c.commit()
+            # ── CACHE cleanup ────────────────────────────────
+            # expired temp bans cache se hata do (auto-unban)
+            purge_expired_bans()
 
             # log only what changed
-            all_freed = {k: v for k, v in {**ram_freed, **db_stats}.items() if v > 0}
+            all_freed = {k: v for k, v in ram_freed.items() if v > 0}
             if all_freed:
                 logger.info(
                     f"[CLEANUP] Freed: {all_freed} | "
@@ -1834,22 +1895,18 @@ def run_cleanup():
 
 
 if __name__ == "__main__":
-    logger.info("Initializing DB...")
-    init_db()
+    logger.info("=" * 50)
+    logger.info("GhostTalk Bot v7.0 (distributed) starting...")
+    logger.info("Render = temp queue + cache | Laptop = master DB")
+    logger.info("=" * 50)
+
+    # 1. local queue/cache + warm from laptop + start background sync
+    init_distributed_system()
+    # 2. let the sync engine trigger user-facing messages (ban/premium)
+    set_notify_callback(on_side_effect)
+
     logger.info("Setting up commands...")
     setup_commands()
-    logger.info("=" * 50)
-    logger.info("GhostTalk Bot v6.0 FINAL starting...")
-    logger.info("✅ Game logic fixed (Guess + Word Chain)")
-    logger.info("✅ Admin notify on settings REMOVED")
-    logger.info("✅ disconnect_user notifies partner")
-    logger.info("✅ Media consent flow fixed")
-    logger.info("✅ Referral atomic read fixed")
-    logger.info("✅ /word command added")
-    logger.info("✅ /msg admin broadcast (memory-safe)")
-    logger.info("✅ Render + UptimeRobot setup")
-    logger.info("✅ Memory cleanup thread (30 min)")
-    logger.info("=" * 50)
 
     # cache bot username once at startup
     get_bot_username()
