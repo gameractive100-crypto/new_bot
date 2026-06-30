@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-GhostTalk Premium Bot - FIXED v6.0
-
-Fixes applied:
-- Game logic properly fixed (guess + word chain both work)
-- Admin notification on gender/settings change REMOVED
-- disconnect_user now notifies partner
-- Media consent flow: partner asked before receiving (stickers bypass)
-- Report lock: duplicate check removed, clean flow
-- Referral count: fixed (atomic read after write)
-- /word command added for word chain
-- Game state: no shared-reference bugs
-- Country change: open to all users (no premium lock)
-"""
-
 import os
 import re
 import random
@@ -481,23 +466,20 @@ def disconnect_user(uid, notify_partner=True, reason="left"):
             try:
                 # "left" = normal disconnect, "banned" = admin kicked
                 if reason == "banned":
-                    msg = "🚫 Partner was removed.\n\nStart fresh?"
+                    title = "🚫 Partner was removed"
                 else:
-                    msg = "👋 Partner left the chat."
+                    title = "Partner ended chat 🚫"
 
-                # Inline report button + search again button
+                # Single message: title + /search hint, with only Report button
                 markup = types.InlineKeyboardMarkup(row_width=1)
                 markup.add(
-                    types.InlineKeyboardButton(
-                        "🚩 Report this partner",
-                        callback_data=f"exrep:{uid}"   # ex-partner uid
-                    )
+                    types.InlineKeyboardButton("🚩 Report", callback_data=f"exrep:{uid}")
                 )
-                bot.send_message(partner, msg, reply_markup=markup)
-                # Send main keyboard separately so they can search again
-                bot.send_message(partner,
-                    "Use 🔀 Search Random to find someone new!",
-                    reply_markup=main_kb(partner))
+                bot.send_message(
+                    partner,
+                    f"{title}\n/search to find new partner",
+                    reply_markup=markup
+                )
             except:
                 pass
     remove_from_queues(uid)
@@ -807,7 +789,7 @@ def process_country_input(message):
 
 @app.route("/", methods=["GET"])
 def home():
-    return "GhostTalk Bot Running!", 200
+    return "FenLiX Bot Running!", 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -874,7 +856,7 @@ def cmd_start(message):
             types.InlineKeyboardButton("♀️ Female", callback_data="sex:female")
         )
         bot.send_message(uid,
-            "🌐 Welcome to GhostTalk!\n\nAnonymous chat platform.\nSelect your gender to get started:",
+            "🌐 Welcome to FenLiX!\n\nAnonymous chat platform.\nSelect your gender to get started:",
             reply_markup=markup)
     elif not u["age"]:
         bot.send_message(uid, "📅 Enter your age (12-99):")
@@ -940,7 +922,6 @@ def cmd_settings(message):
         f"🌍 Country: {(u['country_flag'] or '') + ' ' + (u['country'] or 'Not set')}\n\n"
         f"📊 STATS\n"
         f"💬 Messages: {u['messages_sent']}\n"
-        f"📸 Media Sent: {u['media_approved']}\n"
         f"👥 Referred: {u['referral_count']}/{PREMIUM_REFERRALS_NEEDED}\n\n"
         f"🎁 {ps}"
     )
@@ -1008,7 +989,7 @@ def cmd_refer(message):
 # SEARCH
 # ============================================
 
-@bot.message_handler(commands=["search_random"])
+@bot.message_handler(commands=["search_random", "search"])
 def cmd_search_random(message):
     uid = message.from_user.id
     if db_is_banned(uid):
@@ -1021,12 +1002,12 @@ def cmd_search_random(message):
         bot.send_message(uid, "Already in chat! Use ⏭️ Next or 🛑 Stop.")
         return
     in_q = uid in waiting_random or any(u == uid for u, _ in waiting_opposite)
-    if not in_q:
-        # naya add karo queue mein
-        remove_from_queues(uid)
-        waiting_random.append(uid)
-        bot.send_message(uid, "🔍 Searching for a random partner...")
-    # hamesha match_users call karo - chahe pehle se queue mein ho ya abhi add kiya
+    if in_q:
+        bot.send_message(uid, "🔍 Already searching... please wait!")
+        return
+    remove_from_queues(uid)
+    waiting_random.append(uid)
+    bot.send_message(uid, "🔍 Searching for a random partner...")
     match_users()
 
 @bot.message_handler(commands=["search_opposite"])
@@ -1047,11 +1028,12 @@ def cmd_search_opposite(message):
         return
     u = db_get_user(uid)
     in_q = uid in waiting_random or any(uid == w for w, _ in waiting_opposite)
-    if not in_q:
-        remove_from_queues(uid)
-        waiting_opposite.append((uid, u["gender"]))
-        bot.send_message(uid, "🔍 Searching for opposite gender partner...")
-    # hamesha match karo
+    if in_q:
+        bot.send_message(uid, "🔍 Already searching... please wait!")
+        return
+    remove_from_queues(uid)
+    waiting_opposite.append((uid, u["gender"]))
+    bot.send_message(uid, "🔍 Searching for opposite gender partner...")
     match_users()
 
 @bot.message_handler(commands=["stop"])
@@ -1112,8 +1094,6 @@ def cb_report(call):
     forward_to_admin(uid, partner_id, rtype_name)
     bot.answer_callback_query(call.id, "Report submitted!", show_alert=False)
     bot.send_message(uid, "✅ Report submitted! Admins reviewing. You can keep chatting.")
-
-
 @bot.callback_query_handler(func=lambda c: c.data.startswith("exrep:"))
 def cb_expartner_report(call):
     """Report after partner left chat"""
@@ -1179,7 +1159,7 @@ def cb_expartner_report_type(call):
     db_add_report(uid, ex_partner_id, rtype_name, "post-chat report")
     forward_to_admin(uid, ex_partner_id, f"{rtype_name} (after chat ended)")
     bot.answer_callback_query(call.id, "Report submitted!")
-    bot.send_message(uid, "✅ Report submitted! Thank you for keeping GhostTalk safe. 🧹")
+    bot.send_message(uid, "✅ Report submitted! Thank you for keeping FenLiX safe. 🧹")
 
 # ============================================
 # GAMES
@@ -1537,7 +1517,6 @@ def handler_text(message):
             f"📊 YOUR STATS\n\n"
             f"{g} {u['gender']} | 🎂 {u['age']} | {u['country_flag']} {u['country']}\n\n"
             f"💬 Messages: {u['messages_sent']}\n"
-            f"📸 Media Sent: {u['media_approved']}\n"
             f"👥 Referred: {u['referral_count']}\n\n"
             f"🎁 {ps}", reply_markup=chat_kb())
         return
@@ -1564,7 +1543,7 @@ def handler_text(message):
             logger.error(f"Forward error: {e}")
             bot.send_message(uid, "❌ Could not send message. Partner may have left.")
     else:
-        bot.send_message(uid, "Not connected. Use 🔀 Search Random.", reply_markup=main_kb(uid))
+        bot.send_message(uid, "💬 You're not in a chat.\nTap /search to find a partner.", reply_markup=main_kb(uid))
 
 # ============================================
 # MEDIA HANDLER
@@ -1572,95 +1551,13 @@ def handler_text(message):
 
 @bot.message_handler(content_types=["photo","document","video","animation","sticker","audio","voice"])
 def handle_media(message):
+    """FenLiX is text-only — no media allowed, not even stickers"""
     uid = message.from_user.id
     if db_is_banned(uid):
-        bot.send_message(uid, "🚫 You are banned.")
         return
     if uid not in active_pairs:
-        bot.send_message(uid, "❌ Not in a chat.")
         return
-    if uid in report_reason_pending:
-        bot.send_message(uid, "⛔ Chat locked during report. Type reason or 'cancel'.")
-        return
-
-    partner = active_pairs[uid]
-    mtype = message.content_type
-    mid_map = {
-        "photo": lambda m: m.photo[-1].file_id,
-        "document": lambda m: m.document.file_id,
-        "video": lambda m: m.video.file_id,
-        "animation": lambda m: m.animation.file_id,
-        "sticker": lambda m: m.sticker.file_id,
-        "audio": lambda m: m.audio.file_id,
-        "voice": lambda m: m.voice.file_id,
-    }
-    media_id = mid_map.get(mtype, lambda m: None)(message)
-    if not media_id:
-        return
-
-    append_history(uid, message.chat.id, message.message_id)
-
-    # stickers: no consent needed
-    if mtype == "sticker":
-        try:
-            bot.send_sticker(partner, media_id)
-            db_count_media(uid)
-        except:
-            bot.send_message(uid, "❌ Could not send sticker.")
-        return
-
-    # ask partner for consent
-    cb_data = f"media:allow:{uid}:{mtype}:{media_id}"
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("✅ Allow", callback_data=cb_data),
-        types.InlineKeyboardButton("❌ Decline", callback_data=f"media:deny:{uid}"),
-    )
-    try:
-        bot.send_message(partner,
-            f"📎 Partner wants to send a {mtype}.\nAllow?", reply_markup=markup)
-        bot.send_message(uid, "⏳ Waiting for partner to accept your media...")
-    except:
-        bot.send_message(uid, "❌ Could not request consent.")
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("media:"))
-def cb_media(call):
-    parts = call.data.split(":")
-    action = parts[1]
-    sender_id = int(parts[2])
-
-    if action == "deny":
-        bot.answer_callback_query(call.id, "Media declined.")
-        try:
-            bot.send_message(sender_id, "❌ Partner declined your media.")
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        except:
-            pass
-        return
-
-    # allow
-    mtype = parts[3]
-    media_id = ":".join(parts[4:])
-    bot.answer_callback_query(call.id, "Media accepted!")
-    try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-    except:
-        pass
-
-    send_map = {
-        "photo": bot.send_photo, "document": bot.send_document,
-        "video": bot.send_video, "animation": bot.send_animation,
-        "audio": bot.send_audio, "voice": bot.send_voice,
-    }
-    fn = send_map.get(mtype)
-    if fn:
-        try:
-            fn(call.from_user.id, media_id)
-            db_count_media(sender_id)
-            bot.send_message(sender_id, "✅ Media delivered!")
-        except Exception as e:
-            logger.error(f"Media deliver error: {e}")
-            bot.send_message(sender_id, "❌ Could not deliver media.")
+    bot.send_message(uid, "🚫 Only text messages are allowed on FenLiX.")
 
 # ============================================
 # /msg  — ADMIN BROADCAST  (memory-safe, batched)
@@ -1773,7 +1670,7 @@ def cmd_broadcast(message):
 def setup_commands():
     cmds = [
         types.BotCommand("start", "Start & setup profile"),
-        types.BotCommand("search_random", "Find random chat partner"),
+        types.BotCommand("search", "Find random chat partner"),
         types.BotCommand("search_opposite", "Opposite gender (Premium)"),
         types.BotCommand("next", "Skip to next partner"),
         types.BotCommand("stop", "Stop chatting/searching"),
@@ -1896,7 +1793,7 @@ def run_cleanup():
 
 if __name__ == "__main__":
     logger.info("=" * 50)
-    logger.info("GhostTalk Bot v7.0 (distributed) starting...")
+    logger.info("FenLiX Bot v7.0 (distributed) starting...")
     logger.info("Render = temp queue + cache | Laptop = master DB")
     logger.info("=" * 50)
 
